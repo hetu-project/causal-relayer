@@ -1,0 +1,14 @@
+[network]
+p2p_port = 20000
+rpc_port = 30000
+external_ip = "192.168.0.107"  # Replace with your actual external IP
+
+[node]
+# The private key should be a base64-encoded Ed25519 private key
+# Leave empty to generate a new key pair each time
+private_key = "CAESQM10ZwBDB7ppoZidKVQaoL9NUrSZlMg36qBO31buZG6mdHwcmhAuTDU4nToihGBHSd4CFZSA8LUnOOGNGGOOvHU="
+bootstrap_peers = [
+]
+
+[storage]
+path = "./data"  # Path to store node data
