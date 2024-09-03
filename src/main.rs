@@ -26,6 +26,7 @@ struct NodeBehaviour {
 enum NodeEvent {
     Gossipsub(gossipsub::Event),
     Mdns(mdns::Event),
+    PeerDiscovered(PeerId, Vec<Multiaddr>),
 }
 
 impl From<gossipsub::Event> for NodeEvent {
@@ -36,9 +37,18 @@ impl From<gossipsub::Event> for NodeEvent {
 
 impl From<mdns::Event> for NodeEvent {
     fn from(event: mdns::Event) -> Self {
-        NodeEvent::Mdns(event)
+        match event {
+            mdns::Event::Discovered(list) => {
+                list.into_iter()
+                    .next()
+                    .map(|(peer_id, addrs)| NodeEvent::PeerDiscovered(peer_id, vec![addrs]))
+                    .unwrap_or(NodeEvent::Mdns(mdns::Event::Discovered(Vec::new())))
+            }
+            other => NodeEvent::Mdns(other),
+        }
     }
 }
+
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct DataWithClock {
@@ -64,6 +74,24 @@ impl Node {
     async fn start(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
         loop {
             match self.swarm.select_next_some().await {
+                SwarmEvent::Behaviour(NodeEvent::PeerDiscovered(peer_id, addrs)) => {
+                    info!("Discovered peer: {:?} at {:?}", peer_id, addrs);
+                    for addr in addrs {
+                        match self.swarm.dial(addr.clone()) {
+                            Ok(_) => info!("Dialing discovered peer: {:?} at {:?}", peer_id, addr),
+                            Err(e) => warn!("Failed to dial discovered peer: {:?} at {:?}. Error: {:?}", peer_id, addr, e),
+                        }
+                    }
+                }
+                SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                    info!("Connected to peer: {:?} via {:?}", peer_id, endpoint);
+                }
+                SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+                    info!("Disconnected from peer: {:?}. Cause: {:?}", peer_id, cause);
+                }
+                SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                    warn!("Failed to connect to peer {:?}. Error: {:?}", peer_id, error);
+                }
                 SwarmEvent::Behaviour(NodeEvent::Gossipsub(gossipsub::Event::Message {
                                                                propagation_source,
                                                                message_id,
@@ -282,12 +310,12 @@ fn load_config(config_path: &str) -> Result<Config, Box<dyn Error + Send + Sync>
 }
 
 async fn run_node(node: &mut Node, rx: &mut mpsc::Receiver<String>) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let mut interval = tokio::time::interval(Duration::from_secs(2));
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
              _ = interval.tick() => {
-                let num_peers = node.swarm.connected_peers().count();
-                info!("Connected peers: {}", num_peers);
+                let connected_peers: Vec<_> = node.swarm.connected_peers().collect();
+                info!("Connected peers: {} - {:?}", connected_peers.len(), connected_peers);
             }
             result = node.start() => {
                 if let Err(e) = result {
