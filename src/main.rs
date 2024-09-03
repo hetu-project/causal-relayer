@@ -9,6 +9,7 @@ use tracing::{info, warn, error};
 use jsonrpc_core::{IoHandler, Params, Value};
 use jsonrpc_http_server::ServerBuilder;
 use std::net::SocketAddr;
+use std::process;
 
 #[derive(NetworkBehaviour)]
 #[behaviour(out_event = "NodeEvent")]
@@ -134,16 +135,38 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     info!("P2P node {} listening on /ip4/0.0.0.0/tcp/{}", peer_id, p2p_port);
 
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel::<()>();
+    let shutdown_signal = async move {
+        tokio::signal::ctrl_c().await.expect("Failed to install Ctrl+C handler");
+        shutdown_sender.send(()).expect("Failed to send shutdown signal");
+    };
+
+    tokio::select! {
+        _ = shutdown_signal => {
+            info!("Received Ctrl+C, shutting down");
+        }
+        _ = shutdown_receiver => {
+            info!("Shutdown signal received");
+        }
+        result = run_node(&mut node, &mut rx) => {
+            if let Err(e) = result {
+                error!("Node error: {:?}", e);
+            }
+        }
+    }
+
+    // Perform any necessary cleanup here
+    info!("Cleanup complete, exiting");
+    process::exit(0);
+}
+
+async fn run_node(node: &mut Node, rx: &mut mpsc::Receiver<String>) -> Result<(), Box<dyn Error + Send + Sync>> {
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                info!("Received Ctrl+C, shutting down");
-                break;
-            }
             result = node.start() => {
                 if let Err(e) = result {
                     error!("Node error: {:?}", e);
-                    break;
+                    return Err(e.into());
                 }
             }
             Some(message) = rx.recv() => {
@@ -156,8 +179,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             }
         }
     }
-
-    Ok(())
 }
 
 fn parse_args() -> Result<(u16, u16), Box<dyn Error + Send + Sync>> {
