@@ -233,11 +233,12 @@ async fn connect_to_bootstrap_peers(node: &mut Node, config: &Config) -> Result<
     if let Ok(bootstrap_peers) = config.get_array("node.bootstrap_peers") {
         for peer in bootstrap_peers {
             if let Ok(addr) = peer.into_string() {
-                match addr.parse() {
+                match addr.parse::<Multiaddr>() {
                     Ok(multiaddr) => {
                         info!("Connecting to bootstrap peer: {}", addr);
-                        if let Err(e) = node.connect_to_peer(multiaddr).await {
-                            warn!("Failed to connect to bootstrap peer {}: {:?}", addr, e);
+                        match node.swarm.dial(multiaddr.clone()) {
+                            Ok(_) => info!("Dialing peer: {}", addr),
+                            Err(e) => warn!("Failed to dial peer {}: {:?}", addr, e),
                         }
                     }
                     Err(e) => {
