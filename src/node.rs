@@ -1,14 +1,15 @@
+use std::cmp::Ordering;
 use crate::behaviour::{NodeBehaviour, NodeEvent};
 use libp2p::{gossipsub, identity, swarm::{SwarmEvent, Swarm}, Multiaddr, PeerId, Transport};
 use libp2p::{tcp, noise, yamux};
 use libp2p::core::upgrade;
 use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use tokio::sync::mpsc;
 use tracing::{info, warn, error};
 use config::Config;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::interval;
 use base64::{Engine as _, engine::general_purpose};
 use jsonrpc_core::futures_util::StreamExt;
@@ -18,8 +19,57 @@ pub struct DataWithClock {
     pub data: String,
     #[serde(with = "peer_id_serde")]
     pub vector_clock: HashMap<PeerId, u64>,
+    pub timestamp: u64,
 }
 
+impl PartialOrd for DataWithClock {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DataWithClock {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // First, compare using vector clocks
+        let mut self_greater = false;
+        let mut other_greater = false;
+
+        for (peer, &self_count) in &self.vector_clock {
+            match other.vector_clock.get(peer) {
+                Some(&other_count) => {
+                    if self_count > other_count {
+                        self_greater = true;
+                    } else if other_count > self_count {
+                        other_greater = true;
+                    }
+                }
+                None => self_greater = true,
+            }
+        }
+
+        for peer in other.vector_clock.keys() {
+            if !self.vector_clock.contains_key(peer) {
+                other_greater = true;
+            }
+        }
+
+        match (self_greater, other_greater) {
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => Ordering::Equal,
+            // If vector clocks are concurrent, use timestamp as tie-breaker
+            (true, true) => self.timestamp.cmp(&other.timestamp),
+        }
+    }
+}
+
+impl PartialEq for DataWithClock {
+    fn eq(&self, other: &Self) -> bool {
+        self.vector_clock == other.vector_clock
+    }
+}
+
+impl Eq for DataWithClock {}
 mod peer_id_serde {
     use libp2p::PeerId;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -61,16 +111,18 @@ mod peer_id_serde {
 
 pub struct Node {
     swarm: Swarm<NodeBehaviour>,
-    vector_clock: u64,
+    vector_clock: HashMap<PeerId, u64>,
     topic: gossipsub::IdentTopic,
+    stored_data: BTreeMap<DataWithClock, ()>, // Use DataWithClock as the key for sorting
 }
 
 impl Node {
     pub fn new(swarm: Swarm<NodeBehaviour>) -> Self {
         Node {
             swarm,
-            vector_clock: 0,
+            vector_clock: HashMap::new(),
             topic: gossipsub::IdentTopic::new("relay_data"),
+            stored_data: BTreeMap::new(),
         }
     }
 
@@ -145,16 +197,16 @@ impl Node {
         }
     }
 
-    pub async fn process_received_data(&mut self, data: DataWithClock) -> Result<(), Box<dyn Error + Send + Sync>> {
+    pub async fn process_received_data(&mut self, mut data: DataWithClock) -> Result<(), Box<dyn Error + Send + Sync>> {
         info!("Received data from peer: {:?}", data);
 
         let local_peer_id = *self.swarm.local_peer_id();
 
         // Check if the received data is newer based on vector clock
-        let mut is_new_data = true;  // Assume data is new unless proven otherwise
+        let mut is_new_data = true;
         for (&peer_id, &received_clock) in &data.vector_clock {
-            if peer_id == local_peer_id {
-                if received_clock <= self.vector_clock {
+            if let Some(&local_clock) = self.vector_clock.get(&peer_id) {
+                if received_clock <= local_clock {
                     is_new_data = false;
                     break;
                 }
@@ -163,29 +215,40 @@ impl Node {
 
         // If it's new data, update our clock and republish
         if is_new_data {
-            // Increment our own clock
-            self.vector_clock += 1;
+            // Update our vector clock
+            for (peer_id, &received_clock) in &data.vector_clock {
+                let local_clock = self.vector_clock.entry(*peer_id).or_insert(0);
+                *local_clock = std::cmp::max(*local_clock, received_clock);
+            }
+            let local_clock = self.vector_clock.entry(local_peer_id).or_insert(0);
+            *local_clock += 1;
 
             // Log the updated vector clock
-            info!("Updated vector clock: {}", self.vector_clock);
+            info!("Updated vector clock: {:?}", self.vector_clock);
 
-            let mut updated_vector_clock = data.vector_clock;
-            updated_vector_clock.insert(local_peer_id, self.vector_clock);
+            // Update the received data's vector clock and timestamp
+            data.vector_clock = self.vector_clock.clone();
+            data.timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("Time went backwards")
+                .as_secs();
 
-            let updated_data = DataWithClock {
-                data: data.data,
-                vector_clock: updated_vector_clock,
-            };
+            // Store the data
+            self.stored_data.insert(data.clone(), ());
 
             // Log that we're republishing the data
-            info!("Republishing new data: {:?}", updated_data);
+            info!("Republishing new data: {:?}", data);
 
-            self.publish_data(updated_data).await?;
+            self.publish_data(data).await?;
         } else {
             info!("Received data is not newer than current state. Not republishing.");
         }
 
         Ok(())
+    }
+
+    pub fn get_sorted_data(&self) -> Vec<&DataWithClock> {
+        self.stored_data.keys().collect()
     }
 
     pub async fn publish_data(&mut self, data: DataWithClock) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -265,6 +328,13 @@ impl Node {
                     info!("  Peers in topics: {}", topic_peers);
                     info!("  All known peers: {}", all_peers);
                     info!("  Vector clock: {:?}", self.vector_clock);
+
+                    // Log sorted data
+                    let sorted_data = self.get_sorted_data();
+                    info!("Stored data (sorted by vector clock):");
+                    for data in sorted_data {
+                        info!("  Vector Clock: {:?}, Timestamp: {}, Data: {}", data.vector_clock, data.timestamp, data.data);
+                    }
                 }
 
                 result = self.start() => {
@@ -276,15 +346,21 @@ impl Node {
                 Some(message) = rx.recv() => {
                     // Log the received data and vector clock
                     info!("Received data from RPC: {}", message);
-                    info!("Current vector clock: {}", self.vector_clock);
-                    self.vector_clock += 1;
+                    info!("Current vector clock: {:?}", self.vector_clock);
 
-                    let mut vector_clock = HashMap::new();
-                    vector_clock.insert(*self.swarm.local_peer_id(), self.vector_clock);
+                    let local_peer_id = *self.swarm.local_peer_id();
+                    let local_clock = self.vector_clock.entry(local_peer_id).or_insert(0);
+                    *local_clock += 1;
+
+                    let timestamp = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .expect("Time went backwards")
+                        .as_secs();
 
                     let data_with_clock = DataWithClock {
                         data: message,
-                        vector_clock,
+                        vector_clock: self.vector_clock.clone(),
+                        timestamp,
                     };
 
                     // Log the data being published
