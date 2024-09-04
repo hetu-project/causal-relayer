@@ -1,14 +1,19 @@
-use jsonrpc_core::{IoHandler, Params, Value};
+use jsonrpc_core::{IoHandler, Params, Value, Error as RpcError};
 use jsonrpc_http_server::ServerBuilder;
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
 use tracing::{info, warn, error};
+use std::sync::Arc;
+use tokio::runtime::Runtime;
+use crate::node::Node;
+use serde_json::json;
 
-pub async fn run_json_rpc_server(address: SocketAddr, tx: mpsc::Sender<String>) {
+pub fn run_json_rpc_server(address: SocketAddr, tx: mpsc::Sender<String>, node: Arc<Node>) {
     let mut io = IoHandler::new();
 
     io.add_sync_method("submit_data", move |params: Params| {
         let tx = tx.clone();
+        let rt = Runtime::new().unwrap();
         match params.parse::<Vec<String>>() {
             Ok(data) => {
                 if data.is_empty() {
@@ -17,18 +22,35 @@ pub async fn run_json_rpc_server(address: SocketAddr, tx: mpsc::Sender<String>) 
                 }
                 let message = data[0].clone(); // Get the first string from the array
                 info!("Received data via RPC: {}", message);
-                tokio::spawn(async move {
-                    if let Err(e) = tx.send(message).await {
-                        error!("Failed to send data to channel: {:?}", e);
-                    } else {
+                match rt.block_on(tx.send(message)) {
+                    Ok(_) => {
                         info!("Successfully sent data to channel");
+                        Ok(Value::String("Data submitted successfully".to_string()))
                     }
-                });
-                Ok(Value::String("Data submitted successfully".to_string()))
+                    Err(e) => {
+                        error!("Failed to send data to channel: {:?}", e);
+                        Err(RpcError::internal_error())
+                    }
+                }
             }
             Err(e) => {
                 error!("Failed to parse RPC params: {:?}", e);
-                Err(jsonrpc_core::Error::invalid_params("Invalid parameters"))
+                Err(RpcError::invalid_params("Invalid parameters"))
+            }
+        }
+    });
+
+    io.add_sync_method("drain_data", move |_params: Params| {
+        let node = node.clone();
+        let rt = Runtime::new().unwrap();
+        match rt.block_on(node.drain_data()) {
+            Ok(data) => {
+                let json_data = json!(data);
+                Ok(Value::Array(json_data.as_array().unwrap().clone()))
+            }
+            Err(e) => {
+                error!("Failed to drain data: {:?}", e);
+                Err(RpcError::internal_error())
             }
         }
     });

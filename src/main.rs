@@ -5,6 +5,7 @@ use std::error::Error;
 use tokio::sync::mpsc;
 use tracing::{info, error};
 use std::{env, process};
+use std::sync::Arc;
 
 mod node;
 mod behaviour;
@@ -19,24 +20,27 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let config_path = args.get(1).cloned().unwrap_or_else(|| "config.toml".to_string());
 
     let config = load_config(&config_path)?;
-    let (mut node, peer_id) = Node::create(&config).await?;
+    let (node, peer_id) = Node::create(&config).await?;
+    let node = Arc::new(node);
 
-    let (tx, mut rx) = mpsc::channel::<String>(100);
+    let (tx, rx) = mpsc::channel::<String>(100);
 
     let rpc_port = config.get_int("network.rpc_port")? as u16;
-    let rpc_address = format!("127.0.0.1:{}", rpc_port).parse()?;
-    tokio::spawn(run_json_rpc_server(rpc_address, tx.clone()));
+    let rpc_address = format!("0.0.0.0:{}", rpc_port).parse()?;
+
+    let rpc_node = node.clone();
+
+    // Spawn the RPC server in an async block
+    tokio::spawn(async move {
+        run_json_rpc_server(rpc_address, tx.clone(), rpc_node);
+    });
 
     let p2p_port = config.get_int("network.p2p_port")? as u16;
     info!("P2P node {} listening on /ip4/0.0.0.0/tcp/{}", peer_id, p2p_port);
 
-    // Connect to bootstrap peers
     node.connect_to_bootstrap_peers(&config).await?;
-
     // Wait a bit for the node to establish connections
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-    // Print node addresses
     node.print_node_addresses(&config).await?;
 
     let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel::<()>();
@@ -52,7 +56,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         _ = shutdown_receiver => {
             info!("Shutdown signal received");
         }
-        result = node.run(&mut rx) => {
+        result = node.run(rx) => {
             if let Err(e) = result {
                 error!("Node error: {:?}", e);
             }
