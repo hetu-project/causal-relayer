@@ -1,12 +1,12 @@
-use jsonrpc_core::{IoHandler, Params, Value, Error as RpcError};
+use crate::node::Node;
+use jsonrpc_core::{Error as RpcError, IoHandler, Params, Value};
 use jsonrpc_http_server::ServerBuilder;
+use serde_json::json;
 use std::net::SocketAddr;
-use tokio::sync::mpsc;
-use tracing::{info, warn, error};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
-use crate::node::Node;
-use serde_json::json;
+use tokio::sync::mpsc;
+use tracing::{error, info, warn};
 
 pub fn run_json_rpc_server(address: SocketAddr, tx: mpsc::Sender<String>, node: Arc<Node>) {
     let mut io = IoHandler::new();

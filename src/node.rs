@@ -1,19 +1,23 @@
-use std::cmp::Ordering;
 use crate::behaviour::{NodeBehaviour, NodeEvent};
-use libp2p::{gossipsub, identity, swarm::{SwarmEvent, Swarm}, Multiaddr, PeerId, Transport};
-use libp2p::{tcp, noise, yamux};
+use base64::{engine::general_purpose, Engine as _};
+use config::Config;
+use jsonrpc_core::futures_util::StreamExt;
 use libp2p::core::upgrade;
-use serde::{Serialize, Deserialize};
+use libp2p::{
+    gossipsub, identity,
+    swarm::{Swarm, SwarmEvent},
+    Multiaddr, PeerId, Transport,
+};
+use libp2p::{noise, tcp, yamux};
+use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
-use tracing::{info, warn, error};
-use config::Config;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::interval;
-use base64::{Engine as _, engine::general_purpose};
-use jsonrpc_core::futures_util::StreamExt;
+use tracing::{error, info, warn};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DataWithClock {
@@ -74,21 +78,14 @@ mod peer_id_serde {
         stringified.serialize(serializer)
     }
 
-    pub fn deserialize<'de, D>(
-        deserializer: D,
-    ) -> Result<HashMap<PeerId, u64>, D::Error>
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<HashMap<PeerId, u64>, D::Error>
     where
         D: Deserializer<'de>,
     {
         let stringified: HashMap<String, u64> = HashMap::deserialize(deserializer)?;
         stringified
             .into_iter()
-            .map(|(k, v)| {
-                Ok((
-                    PeerId::from_str(&k).map_err(serde::de::Error::custom)?,
-                    v,
-                ))
-            })
+            .map(|(k, v)| Ok((PeerId::from_str(&k).map_err(serde::de::Error::custom)?, v)))
             .collect()
     }
 }
@@ -120,7 +117,8 @@ impl Node {
         let private_key_str = config.get_string("node.private_key")?;
         let id_keys = if private_key_str.is_empty() {
             let keys = identity::Keypair::generate_ed25519();
-            let encoded_private_key = general_purpose::STANDARD.encode(keys.to_protobuf_encoding()?);
+            let encoded_private_key =
+                general_purpose::STANDARD.encode(keys.to_protobuf_encoding()?);
             info!("Generated new private key. Add this to your config to reuse the same peer ID:");
             info!("private_key = \"{}\"", encoded_private_key);
             keys
@@ -134,7 +132,9 @@ impl Node {
 
         let transport = tcp::tokio::Transport::default()
             .upgrade(upgrade::Version::V1)
-            .authenticate(noise::Config::new(&id_keys).expect("signing libp2p-noise static keypair"))
+            .authenticate(
+                noise::Config::new(&id_keys).expect("signing libp2p-noise static keypair"),
+            )
             .multiplex(yamux::Config::default())
             .boxed();
 
@@ -152,7 +152,10 @@ impl Node {
         Ok((node, peer_id))
     }
 
-    pub async fn process_received_data(&self, mut data: DataWithClock) -> Result<(), Box<dyn Error + Send + Sync>> {
+    pub async fn process_received_data(
+        &self,
+        mut data: DataWithClock,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut inner = self.inner.lock().await;
         info!("Received data from peer: {:?}", data);
 
@@ -213,11 +216,18 @@ impl Node {
         inner.stored_data.keys().cloned().collect()
     }
 
-    pub async fn publish_data(&self, data: DataWithClock) -> Result<(), Box<dyn Error + Send + Sync>> {
+    pub async fn publish_data(
+        &self,
+        data: DataWithClock,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let message = serde_json::to_string(&data)?;
         let mut inner = self.inner.lock().await;
         let topic = inner.topic.clone();
-        inner.swarm.behaviour_mut().gossipsub.publish(topic, message.as_bytes())?;
+        inner
+            .swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(topic, message.as_bytes())?;
 
         Ok(())
     }
@@ -234,7 +244,10 @@ impl Node {
         }
     }
 
-    pub async fn connect_to_bootstrap_peers(&self, config: &Config) -> Result<(), Box<dyn Error + Send + Sync>> {
+    pub async fn connect_to_bootstrap_peers(
+        &self,
+        config: &Config,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut inner = self.inner.lock().await;
         if let Ok(bootstrap_peers) = config.get_array("node.bootstrap_peers") {
             for peer in bootstrap_peers {
@@ -259,7 +272,10 @@ impl Node {
         Ok(())
     }
 
-    pub async fn print_node_addresses(&self, config: &Config) -> Result<(), Box<dyn Error + Send + Sync>> {
+    pub async fn print_node_addresses(
+        &self,
+        config: &Config,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let inner = self.inner.lock().await;
         let local_peer_id = *inner.swarm.local_peer_id();
         let listened_addrs = inner.swarm.listeners().cloned().collect::<Vec<_>>();
@@ -276,91 +292,97 @@ impl Node {
         }
 
         info!("External IP address (from config): {}", external_ip);
-        info!("Full address with external IP: /ip4/{}/tcp/{}/p2p/{}", external_ip, p2p_port, local_peer_id);
+        info!(
+            "Full address with external IP: /ip4/{}/tcp/{}/p2p/{}",
+            external_ip, p2p_port, local_peer_id
+        );
 
         info!("You can share these addresses with others to allow them to connect to your node.");
         Ok(())
     }
 
-    pub async fn run(&self, mut rx: mpsc::Receiver<String>) -> Result<(), Box<dyn Error + Send + Sync>> {
+    pub async fn run(
+        &self,
+        mut rx: mpsc::Receiver<String>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut interval = interval(Duration::from_secs(5));
         loop {
             let mut inner = self.inner.lock().await;
             tokio::select! {
-            _ = interval.tick() => {
-                let connected_peers: Vec<_> = inner.swarm.connected_peers().collect();
-                info!("Connected peers: {} - {:?}", connected_peers.len(), connected_peers);
+                _ = interval.tick() => {
+                    let connected_peers: Vec<_> = inner.swarm.connected_peers().collect();
+                    info!("Connected peers: {} - {:?}", connected_peers.len(), connected_peers);
 
-                // Log GossipSub information
-                let gossipsub = &inner.swarm.behaviour().gossipsub;
-                let topic_peers = gossipsub.topics().fold(0, |acc, topic| acc + gossipsub.mesh_peers(topic).count());
-                let all_peers = gossipsub.all_peers().count();
-                info!("GossipSub info:");
-                info!("  Topics: {:?}", gossipsub.topics().collect::<Vec<_>>());
-                info!("  Peers in topics: {}", topic_peers);
-                info!("  All known peers: {}", all_peers);
-                info!("  Vector clock: {:?}", inner.vector_clock);
-                let sorted_data = inner.stored_data.keys().cloned().collect::<Vec<_>>();
-                info!("Stored data (sorted by vector clock):");
-                for data in sorted_data {
-                    info!("  Vector Clock: {:?}, Timestamp: {}, Data: {}", data.vector_clock, data.timestamp, data.data);
+                    // Log GossipSub information
+                    let gossipsub = &inner.swarm.behaviour().gossipsub;
+                    let topic_peers = gossipsub.topics().fold(0, |acc, topic| acc + gossipsub.mesh_peers(topic).count());
+                    let all_peers = gossipsub.all_peers().count();
+                    info!("GossipSub info:");
+                    info!("  Topics: {:?}", gossipsub.topics().collect::<Vec<_>>());
+                    info!("  Peers in topics: {}", topic_peers);
+                    info!("  All known peers: {}", all_peers);
+                    info!("  Vector clock: {:?}", inner.vector_clock);
+                    let sorted_data = inner.stored_data.keys().cloned().collect::<Vec<_>>();
+                    info!("Stored data (sorted by vector clock):");
+                    for data in sorted_data {
+                        info!("  Vector Clock: {:?}, Timestamp: {}, Data: {}", data.vector_clock, data.timestamp, data.data);
+                    }
                 }
-            }
 
-            Some(message) = rx.recv() => {
-                info!("Received data from RPC: {}", message);
-                let local_peer_id = *inner.swarm.local_peer_id();
-                let local_clock = inner.vector_clock.entry(local_peer_id).or_insert(0);
-                *local_clock += 1;
+                Some(message) = rx.recv() => {
+                    info!("Received data from RPC: {}", message);
+                    let local_peer_id = *inner.swarm.local_peer_id();
+                    let local_clock = inner.vector_clock.entry(local_peer_id).or_insert(0);
+                    *local_clock += 1;
 
-                let timestamp = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .expect("Time went backwards")
-                    .as_secs();
+                    let timestamp = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .expect("Time went backwards")
+                        .as_secs();
 
-                let data_with_clock = DataWithClock {
-                    data: message,
-                    vector_clock: inner.vector_clock.clone(),
-                    timestamp,
-                };
+                    let data_with_clock = DataWithClock {
+                        data: message,
+                        vector_clock: inner.vector_clock.clone(),
+                        timestamp,
+                    };
 
-                info!("Publishing data: {:?}", data_with_clock);
+                    info!("Publishing data: {:?}", data_with_clock);
 
-                // Clone the topic before borrowing inner.swarm mutably
-                let topic = inner.topic.clone();
-                let serialized_data = serde_json::to_string(&data_with_clock)?;
+                    // Clone the topic before borrowing inner.swarm mutably
+                    let topic = inner.topic.clone();
+                    let serialized_data = serde_json::to_string(&data_with_clock)?;
 
-                if let Err(e) = inner.swarm.behaviour_mut().gossipsub.publish(topic, serialized_data.into_bytes()) {
-                    error!("Failed to publish data: {:?}", e);
+                    if let Err(e) = inner.swarm.behaviour_mut().gossipsub.publish(topic, serialized_data.into_bytes()) {
+                        error!("Failed to publish data: {:?}", e);
+                    }
                 }
-            }
 
-            event = inner.swarm.select_next_some() => {
-                match event {
-                    SwarmEvent::Behaviour(NodeEvent::Gossipsub(gossipsub::Event::Message {
-                        propagation_source,
-                        message_id,
-                        message,
-                    })) => {
-                        if let Ok(data) = serde_json::from_slice::<DataWithClock>(&message.data) {
-                            if let Err(e) = self.process_received_data(data).await {
-                                error!("Error processing received data: {:?}", e);
+                event = inner.swarm.select_next_some() => {
+                    match event {
+                        SwarmEvent::Behaviour(NodeEvent::Gossipsub(gossipsub::Event::Message {
+                            propagation_source,
+                            message_id,
+                            message,
+                        })) => {
+                            if let Ok(data) = serde_json::from_slice::<DataWithClock>(&message.data) {
+                                if let Err(e) = self.process_received_data(data).await {
+                                    error!("Error processing received data: {:?}", e);
+                                }
                             }
                         }
+                        SwarmEvent::NewListenAddr { address, .. } => {
+                            info!("Local node is listening on {:?}", address);
+                        }
+                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                            info!("Connected to peer: {:?}", peer_id);
+                        }
+                        SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                            info!("Disconnected from peer: {:?}", peer_id);
+                        }
+                        _ => {}
                     }
-                    SwarmEvent::NewListenAddr { address, .. } => {
-                        info!("Local node is listening on {:?}", address);
-                    }
-                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                        info!("Connected to peer: {:?}", peer_id);
-                    }
-                    SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                        info!("Disconnected from peer: {:?}", peer_id);
-                    }
-                    _ => {}
                 }
             }
-        }
         }
     }
 }

@@ -1,7 +1,7 @@
-use libp2p::{gossipsub, mdns, identity, PeerId, Multiaddr};
+use libp2p::{gossipsub, identity, mdns, Multiaddr, PeerId};
 use libp2p_swarm_derive::NetworkBehaviour;
-use std::time::Duration;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::time::Duration;
 
 #[derive(NetworkBehaviour)]
 #[behaviour(out_event = "NodeEvent")]
@@ -26,10 +26,11 @@ impl NodeBehaviour {
         let gossipsub = gossipsub::Behaviour::new(
             gossipsub::MessageAuthenticity::Signed(id_keys.clone()),
             gossipsub_config,
-        ).expect("Valid configuration");
+        )
+        .expect("Valid configuration");
 
-        let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
-            .expect("Valid config");
+        let mdns =
+            mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id).expect("Valid config");
 
         NodeBehaviour { gossipsub, mdns }
     }
@@ -50,12 +51,11 @@ impl From<gossipsub::Event> for NodeEvent {
 impl From<mdns::Event> for NodeEvent {
     fn from(event: mdns::Event) -> Self {
         match event {
-            mdns::Event::Discovered(list) => {
-                list.into_iter()
-                    .next()
-                    .map(|(peer_id, addrs)| NodeEvent::PeerDiscovered(peer_id, vec![addrs]))
-                    .unwrap_or(NodeEvent::Mdns(mdns::Event::Discovered(Vec::new())))
-            }
+            mdns::Event::Discovered(list) => list
+                .into_iter()
+                .next()
+                .map(|(peer_id, addrs)| NodeEvent::PeerDiscovered(peer_id, vec![addrs]))
+                .unwrap_or(NodeEvent::Mdns(mdns::Event::Discovered(Vec::new()))),
             other => NodeEvent::Mdns(other),
         }
     }

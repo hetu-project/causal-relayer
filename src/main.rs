@@ -1,15 +1,15 @@
-use crate::node::Node;
 use crate::config::load_config;
+use crate::node::Node;
 use crate::rpc::run_json_rpc_server;
 use std::error::Error;
-use tokio::sync::mpsc;
-use tracing::{info, error};
-use std::{env, process};
 use std::sync::Arc;
+use std::{env, process};
+use tokio::sync::mpsc;
+use tracing::{error, info};
 
-mod node;
 mod behaviour;
 mod config;
+mod node;
 mod rpc;
 
 #[tokio::main]
@@ -17,7 +17,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     tracing_subscriber::fmt::init();
 
     let args: Vec<String> = env::args().collect();
-    let config_path = args.get(1).cloned().unwrap_or_else(|| "config.toml".to_string());
+    let config_path = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "config.toml".to_string());
 
     let config = load_config(&config_path)?;
     let (node, peer_id) = Node::create(&config).await?;
@@ -36,7 +39,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     });
 
     let p2p_port = config.get_int("network.p2p_port")? as u16;
-    info!("P2P node {} listening on /ip4/0.0.0.0/tcp/{}", peer_id, p2p_port);
+    info!(
+        "P2P node {} listening on /ip4/0.0.0.0/tcp/{}",
+        peer_id, p2p_port
+    );
 
     node.connect_to_bootstrap_peers(&config).await?;
     // Wait a bit for the node to establish connections
@@ -45,8 +51,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel::<()>();
     let shutdown_signal = async move {
-        tokio::signal::ctrl_c().await.expect("Failed to install Ctrl+C handler");
-        shutdown_sender.send(()).expect("Failed to send shutdown signal");
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+        shutdown_sender
+            .send(())
+            .expect("Failed to send shutdown signal");
     };
 
     tokio::select! {

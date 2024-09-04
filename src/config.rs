@@ -1,8 +1,8 @@
 use config::{Config, ConfigBuilder, Environment, File, FileFormat};
+use std::env;
 use std::error::Error;
 use std::path::Path;
-use tracing::{info, warn, error};
-use std::env;
+use tracing::{error, info, warn};
 
 pub fn load_config(config_path: &str) -> Result<Config, Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = env::args().collect();
@@ -25,7 +25,10 @@ pub fn load_config(config_path: &str) -> Result<Config, Box<dyn Error + Send + S
         builder = builder.add_source(file_source);
         info!("Added config file source");
     } else {
-        warn!("Config file not found at: {}. Using default values.", config_path);
+        warn!(
+            "Config file not found at: {}. Using default values.",
+            config_path
+        );
     }
 
     // Add environment variables
