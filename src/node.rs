@@ -10,6 +10,7 @@ use libp2p::{
 };
 use libp2p::{noise, tcp, yamux};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
@@ -90,15 +91,28 @@ mod peer_id_serde {
     }
 }
 
-struct NodeInner {
+pub struct NodeInner {
     swarm: Swarm<NodeBehaviour>,
     vector_clock: HashMap<PeerId, u64>,
     topic: gossipsub::IdentTopic,
     stored_data: BTreeMap<DataWithClock, ()>,
+    tombstones: HashMap<String, Tombstone>,
 }
 
 pub struct Node {
     inner: Arc<Mutex<NodeInner>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Tombstone {
+    pub data_hash: String,
+    pub drained_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum SyncMessage {
+    Data(DataWithClock),
+    Tombstone(Tombstone),
 }
 
 impl Node {
@@ -109,6 +123,7 @@ impl Node {
                 vector_clock: HashMap::new(),
                 topic: gossipsub::IdentTopic::new("relay_data"),
                 stored_data: BTreeMap::new(),
+                tombstones: Default::default(),
             })),
         }
     }
@@ -152,53 +167,61 @@ impl Node {
         Ok((node, peer_id))
     }
 
-    pub async fn process_received_data(
+    async fn process_received_data(
         &self,
-        mut data: DataWithClock,
+        data: DataWithClock,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut inner = self.inner.lock().await;
-        info!("Received data from peer: {:?}", data);
+        let data_hash = calculate_hash(&data);
 
-        let local_peer_id = *inner.swarm.local_peer_id();
-
-        // Check if the received data is newer based on vector clock
-        let mut is_new_data = true;
-        for (&peer_id, &received_clock) in &data.vector_clock {
-            if let Some(&local_clock) = inner.vector_clock.get(&peer_id) {
-                if received_clock <= local_clock {
-                    is_new_data = false;
-                    break;
-                }
-            }
+        if inner.tombstones.contains_key(&data_hash) {
+            info!("Received data has been drained, ignoring: {:?}", data);
+            return Ok(());
         }
 
-        // If it's new data, update our clock and republish
-        if is_new_data {
-            // Update our vector clock
-            for (peer_id, &received_clock) in &data.vector_clock {
-                let local_clock = inner.vector_clock.entry(*peer_id).or_insert(0);
-                *local_clock = std::cmp::max(*local_clock, received_clock);
-            }
-            let local_clock = inner.vector_clock.entry(local_peer_id).or_insert(0);
-            *local_clock += 1;
-
-            info!("Updated vector clock: {:?}", inner.vector_clock);
-
-            // Update the received data's vector clock and timestamp
-            data.vector_clock = inner.vector_clock.clone();
-            data.timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("Time went backwards")
-                .as_secs();
-
+        if !inner.stored_data.contains_key(&data) {
             inner.stored_data.insert(data.clone(), ());
-            info!("Republishing new data: {:?}", data);
+            info!("Stored new data: {:?}", data);
 
-            // Now we can call publish_data without holding the lock
-            drop(inner); // Release the lock before calling publish_data
-            self.publish_data(data).await?;
+            // Republish the data
+            let sync_message = SyncMessage::Data(data);
+            let topic = inner.topic.clone();
+            let serialized_message = serde_json::to_string(&sync_message)?;
+            inner
+                .swarm
+                .behaviour_mut()
+                .gossipsub
+                .publish(topic, serialized_message.into_bytes())?;
         } else {
-            info!("Received data is not newer than current state. Not republishing.");
+            info!("Received data already exists. Not storing or republishing.");
+        }
+
+        Ok(())
+    }
+
+    async fn process_tombstone(
+        &self,
+        tombstone: Tombstone,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let mut inner = self.inner.lock().await;
+
+        if !inner.tombstones.contains_key(&tombstone.data_hash) {
+            inner
+                .stored_data
+                .retain(|data, _| calculate_hash(data) != tombstone.data_hash);
+            inner
+                .tombstones
+                .insert(tombstone.data_hash.clone(), tombstone.clone());
+
+            // Republish the tombstone
+            let sync_message = SyncMessage::Tombstone(tombstone);
+            let topic = inner.topic.clone();
+            let serialized_message = serde_json::to_string(&sync_message)?;
+            inner
+                .swarm
+                .behaviour_mut()
+                .gossipsub
+                .publish(topic, serialized_message.into_bytes())?;
         }
 
         Ok(())
@@ -207,29 +230,34 @@ impl Node {
     pub async fn drain_data(&self) -> Result<Vec<DataWithClock>, Box<dyn Error + Send + Sync>> {
         let mut inner = self.inner.lock().await;
         let drained_data: Vec<DataWithClock> = inner.stored_data.keys().cloned().collect();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs();
+
+        for data in &drained_data {
+            let data_hash = calculate_hash(data);
+            let tombstone = Tombstone {
+                data_hash: data_hash.clone(),
+                drained_at: now,
+            };
+            inner.tombstones.insert(data_hash, tombstone.clone());
+
+            // Publish tombstone immediately
+            let sync_message = SyncMessage::Tombstone(tombstone);
+            let topic = inner.topic.clone();
+            let serialized_message = serde_json::to_string(&sync_message)?;
+            inner
+                .swarm
+                .behaviour_mut()
+                .gossipsub
+                .publish(topic, serialized_message.into_bytes())?;
+        }
+
         inner.stored_data.clear();
+
         Ok(drained_data)
-    }
-
-    pub async fn get_sorted_data(&self) -> Vec<DataWithClock> {
-        let inner = self.inner.lock().await;
-        inner.stored_data.keys().cloned().collect()
-    }
-
-    pub async fn publish_data(
-        &self,
-        data: DataWithClock,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let message = serde_json::to_string(&data)?;
-        let mut inner = self.inner.lock().await;
-        let topic = inner.topic.clone();
-        inner
-            .swarm
-            .behaviour_mut()
-            .gossipsub
-            .publish(topic, message.as_bytes())?;
-
-        Ok(())
     }
 
     pub async fn subscribe_to_topic(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -307,9 +335,9 @@ impl Node {
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut interval = interval(Duration::from_secs(5));
         loop {
-            let mut inner = self.inner.lock().await;
             tokio::select! {
                 _ = interval.tick() => {
+                    let mut inner = self.inner.lock().await;
                     let connected_peers: Vec<_> = inner.swarm.connected_peers().collect();
                     info!("Connected peers: {} - {:?}", connected_peers.len(), connected_peers);
 
@@ -330,6 +358,7 @@ impl Node {
                 }
 
                 Some(message) = rx.recv() => {
+                    let mut inner = self.inner.lock().await;
                     info!("Received data from RPC: {}", message);
                     let local_peer_id = *inner.swarm.local_peer_id();
                     let local_clock = inner.vector_clock.entry(local_peer_id).or_insert(0);
@@ -346,27 +375,45 @@ impl Node {
                         timestamp,
                     };
 
-                    info!("Publishing data: {:?}", data_with_clock);
+                    // Store the data locally
+                    inner.stored_data.insert(data_with_clock.clone(), ());
+
+                    info!("Storing and publishing data: {:?}", data_with_clock);
 
                     // Clone the topic before borrowing inner.swarm mutably
                     let topic = inner.topic.clone();
-                    let serialized_data = serde_json::to_string(&data_with_clock)?;
+                    let sync_message = SyncMessage::Data(data_with_clock);
+                    let serialized_message = serde_json::to_string(&sync_message)?;
 
-                    if let Err(e) = inner.swarm.behaviour_mut().gossipsub.publish(topic, serialized_data.into_bytes()) {
+                    if let Err(e) = inner.swarm.behaviour_mut().gossipsub.publish(topic, serialized_message.into_bytes()) {
                         error!("Failed to publish data: {:?}", e);
                     }
                 }
 
-                event = inner.swarm.select_next_some() => {
+                event = self.next_event() => {
                     match event {
                         SwarmEvent::Behaviour(NodeEvent::Gossipsub(gossipsub::Event::Message {
                             propagation_source,
                             message_id,
                             message,
                         })) => {
-                            if let Ok(data) = serde_json::from_slice::<DataWithClock>(&message.data) {
-                                if let Err(e) = self.process_received_data(data).await {
-                                    error!("Error processing received data: {:?}", e);
+                            match serde_json::from_slice::<SyncMessage>(&message.data) {
+                                Ok(sync_message) => {
+                                    match sync_message {
+                                        SyncMessage::Data(data) => {
+                                            if let Err(e) = self.process_received_data(data).await {
+                                                error!("Error processing received data: {:?}", e);
+                                            }
+                                        }
+                                        SyncMessage::Tombstone(tombstone) => {
+                                            if let Err(e) = self.process_tombstone(tombstone).await {
+                                                error!("Error processing tombstone: {:?}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to deserialize message: {:?}", e);
                                 }
                             }
                         }
@@ -385,4 +432,14 @@ impl Node {
             }
         }
     }
+
+    async fn next_event(&self) -> SwarmEvent<NodeEvent> {
+        self.inner.lock().await.swarm.select_next_some().await
+    }
+}
+
+fn calculate_hash(data: &DataWithClock) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data.data.as_bytes());
+    format!("{:x}", hasher.finalize())
 }

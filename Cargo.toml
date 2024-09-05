@@ -18,3 +18,4 @@ warp = "0.3"
 hex = "0.4.3"
 config = { version = "0.14", features = ["toml"] }
 base64 = "0.22"
+sha2 = "0.10.8"

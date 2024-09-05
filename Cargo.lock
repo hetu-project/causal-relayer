@@ -324,6 +324,7 @@ dependencies = [
  "libp2p-swarm-derive",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tracing",
  "tracing-subscriber",

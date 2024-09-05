@@ -12,7 +12,7 @@ mod config;
 mod node;
 mod rpc;
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     tracing_subscriber::fmt::init();
 
@@ -32,8 +32,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let rpc_address = format!("0.0.0.0:{}", rpc_port).parse()?;
 
     let rpc_node = node.clone();
-
-    // Spawn the RPC server in an async block
     tokio::spawn(async move {
         run_json_rpc_server(rpc_address, tx.clone(), rpc_node);
     });
