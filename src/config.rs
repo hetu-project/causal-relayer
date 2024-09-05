@@ -7,7 +7,7 @@ use tracing::{error, info, warn};
 pub fn load_config(config_path: &str) -> Result<Config, Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = env::args().collect();
 
-    let mut builder = Config::builder();
+    let mut builder = ConfigBuilder::<config::builder::DefaultState>::default();
 
     // Add default values
     builder = builder
@@ -21,8 +21,7 @@ pub fn load_config(config_path: &str) -> Result<Config, Box<dyn Error + Send + S
     let config_file = Path::new(config_path);
     if config_file.exists() {
         info!("Config file found at: {}", config_path);
-        let file_source = File::new(config_path, FileFormat::Toml).required(true);
-        builder = builder.add_source(file_source);
+        builder = builder.add_source(File::new(config_path, FileFormat::Toml).required(true));
         info!("Added config file source");
     } else {
         warn!(

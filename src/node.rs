@@ -228,13 +228,19 @@ impl Node {
     }
 
     pub async fn drain_data(&self) -> Result<Vec<DataWithClock>, Box<dyn Error + Send + Sync>> {
+        let (tx, mut rx) = mpsc::channel(1000); // Adjust buffer size as needed
+
         let mut inner = self.inner.lock().await;
-        let drained_data: Vec<DataWithClock> = inner.stored_data.keys().cloned().collect();
+        let drained_data: Vec<DataWithClock> = std::mem::take(&mut inner.stored_data)
+            .into_keys()
+            .collect();
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
             .as_secs();
+
+        let topic = inner.topic.clone();
 
         for data in &drained_data {
             let data_hash = calculate_hash(data);
@@ -243,19 +249,26 @@ impl Node {
                 drained_at: now,
             };
             inner.tombstones.insert(data_hash, tombstone.clone());
-
-            // Publish tombstone immediately
-            let sync_message = SyncMessage::Tombstone(tombstone);
-            let topic = inner.topic.clone();
-            let serialized_message = serde_json::to_string(&sync_message)?;
-            inner
-                .swarm
-                .behaviour_mut()
-                .gossipsub
-                .publish(topic, serialized_message.into_bytes())?;
+            tx.send((topic.clone(), tombstone)).await?;
         }
 
-        inner.stored_data.clear();
+        // Clone the necessary components
+        let inner_clone = self.inner.clone();
+
+        // Release the lock before starting the publishing task
+        drop(inner);
+
+        // Start a task to publish tombstones
+        tokio::spawn(async move {
+            while let Some((topic, tombstone)) = rx.recv().await {
+                let sync_message = SyncMessage::Tombstone(tombstone);
+                let serialized_message = serde_json::to_string(&sync_message).unwrap();
+                let mut inner = inner_clone.lock().await;
+                if let Err(e) = inner.swarm.behaviour_mut().gossipsub.publish(topic, serialized_message.into_bytes()) {
+                    error!("Failed to publish tombstone: {:?}", e);
+                }
+            }
+        });
 
         Ok(drained_data)
     }
