@@ -169,7 +169,7 @@ impl Node {
 
     async fn process_received_data(
         &self,
-        data: DataWithClock,
+        mut data: DataWithClock,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut inner = self.inner.lock().await;
         let data_hash = calculate_hash(&data);
@@ -179,11 +179,29 @@ impl Node {
             return Ok(());
         }
 
-        if !inner.stored_data.contains_key(&data) {
-            inner.stored_data.insert(data.clone(), ());
-            info!("Stored new data: {:?}", data);
+        let local_peer_id = *inner.swarm.local_peer_id();
+        let should_update_clock = !data.vector_clock.contains_key(&local_peer_id);
 
-            // Republish the data
+        if !inner.stored_data.contains_key(&data) || should_update_clock {
+            if should_update_clock {
+                // Increment local clock
+                let local_clock = inner.vector_clock.entry(local_peer_id).or_insert(0);
+                *local_clock += 1;
+
+                // Update the data's vector clock with our local clock
+                data.vector_clock.insert(local_peer_id, *local_clock);
+
+                // Update timestamp
+                data.timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("Time went backwards")
+                    .as_secs();
+            }
+
+            inner.stored_data.insert(data.clone(), ());
+            info!("Stored new or updated data: {:?}", data);
+
+            // Republish the data with updated clock
             let sync_message = SyncMessage::Data(data);
             let topic = inner.topic.clone();
             let serialized_message = serde_json::to_string(&sync_message)?;
@@ -193,35 +211,59 @@ impl Node {
                 .gossipsub
                 .publish(topic, serialized_message.into_bytes())?;
         } else {
-            info!("Received data already exists. Not storing or republishing.");
+            info!("Received data already exists and doesn't need updating.");
         }
 
         Ok(())
     }
 
-    async fn process_tombstone(
+    async fn process_tombstones(
         &self,
-        tombstone: Tombstone,
+        tombstones: Vec<Tombstone>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut inner = self.inner.lock().await;
+        let mut new_tombstones = Vec::new();
 
-        if !inner.tombstones.contains_key(&tombstone.data_hash) {
-            inner
-                .stored_data
-                .retain(|data, _| calculate_hash(data) != tombstone.data_hash);
-            inner
-                .tombstones
-                .insert(tombstone.data_hash.clone(), tombstone.clone());
+        // Collect all new tombstones
+        for tombstone in tombstones {
+            if !inner.tombstones.contains_key(&tombstone.data_hash) {
+                new_tombstones.push(tombstone);
+            }
+        }
 
-            // Republish the tombstone
-            let sync_message = SyncMessage::Tombstone(tombstone);
+        if !new_tombstones.is_empty() {
+            // Clear all stored data
+            let cleared_data = std::mem::take(&mut inner.stored_data);
+
+            // Create a HashSet of tombstone hashes for faster lookup
+            let tombstone_hashes: std::collections::HashSet<_> =
+                new_tombstones.iter().map(|t| t.data_hash.clone()).collect();
+
+            // Re-add data that isn't contained in any of the new tombstones
+            for (data, _) in cleared_data {
+                if !tombstone_hashes.contains(&calculate_hash(&data)) {
+                    inner.stored_data.insert(data, ());
+                }
+            }
+
+            // Add the new tombstones
+            for tombstone in &new_tombstones {
+                inner
+                    .tombstones
+                    .insert(tombstone.data_hash.clone(), tombstone.clone());
+            }
+
+            // Republish the tombstones
             let topic = inner.topic.clone();
-            let serialized_message = serde_json::to_string(&sync_message)?;
-            inner
-                .swarm
-                .behaviour_mut()
-                .gossipsub
-                .publish(topic, serialized_message.into_bytes())?;
+            for tombstone in new_tombstones {
+                let sync_message = SyncMessage::Tombstone(tombstone);
+                let serialized_message = serde_json::to_string(&sync_message)?;
+                inner
+                    .swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .publish(topic.clone(), serialized_message.into_bytes())?;
+            }
         }
 
         Ok(())
@@ -231,9 +273,8 @@ impl Node {
         let (tx, mut rx) = mpsc::channel(1000); // Adjust buffer size as needed
 
         let mut inner = self.inner.lock().await;
-        let drained_data: Vec<DataWithClock> = std::mem::take(&mut inner.stored_data)
-            .into_keys()
-            .collect();
+        let drained_data: Vec<DataWithClock> =
+            std::mem::take(&mut inner.stored_data).into_keys().collect();
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -264,7 +305,12 @@ impl Node {
                 let sync_message = SyncMessage::Tombstone(tombstone);
                 let serialized_message = serde_json::to_string(&sync_message).unwrap();
                 let mut inner = inner_clone.lock().await;
-                if let Err(e) = inner.swarm.behaviour_mut().gossipsub.publish(topic, serialized_message.into_bytes()) {
+                if let Err(e) = inner
+                    .swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .publish(topic, serialized_message.into_bytes())
+                {
                     error!("Failed to publish tombstone: {:?}", e);
                 }
             }
@@ -346,10 +392,13 @@ impl Node {
         &self,
         mut rx: mpsc::Receiver<String>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let mut interval = interval(Duration::from_secs(5));
+        let mut log_interval = interval(Duration::from_secs(5));
+        let mut tombstone_batch = Vec::new();
+        let mut tombstone_process_interval = interval(Duration::from_millis(100));
+
         loop {
             tokio::select! {
-                _ = interval.tick() => {
+                _ = log_interval.tick() => {
                     let mut inner = self.inner.lock().await;
                     let connected_peers: Vec<_> = inner.swarm.connected_peers().collect();
                     info!("Connected peers: {} - {:?}", connected_peers.len(), connected_peers);
@@ -403,6 +452,15 @@ impl Node {
                     }
                 }
 
+                _ = tombstone_process_interval.tick() => {
+                if !tombstone_batch.is_empty() {
+                    if let Err(e) = self.process_tombstones(std::mem::take(&mut tombstone_batch)).await {
+                        error!("Error processing tombstone batch: {:?}", e);
+                    }
+                }
+            }
+
+
                 event = self.next_event() => {
                     match event {
                         SwarmEvent::Behaviour(NodeEvent::Gossipsub(gossipsub::Event::Message {
@@ -414,17 +472,15 @@ impl Node {
                                 Ok(sync_message) => {
                                     match sync_message {
                                         SyncMessage::Data(data) => {
-                                            if let Err(e) = self.process_received_data(data).await {
-                                                error!("Error processing received data: {:?}", e);
-                                            }
+                                        if let Err(e) = self.process_received_data(data).await {
+                                            error!("Error processing received data: {:?}", e);}
                                         }
                                         SyncMessage::Tombstone(tombstone) => {
-                                            if let Err(e) = self.process_tombstone(tombstone).await {
-                                                error!("Error processing tombstone: {:?}", e);
-                                            }
+                                        tombstone_batch.push(tombstone);
                                         }
                                     }
                                 }
+
                                 Err(e) => {
                                     error!("Failed to deserialize message: {:?}", e);
                                 }

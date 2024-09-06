@@ -13,7 +13,6 @@ pub fn run_json_rpc_server(address: SocketAddr, tx: mpsc::Sender<String>, node: 
     let runtime = Arc::new(Runtime::new().expect("Failed to create Tokio runtime"));
     let mut io = IoHandler::new();
 
-    // Use a HashSet to keep track of submitted data
     let submitted_data = Arc::new(Mutex::new(HashSet::new()));
 
     io.add_method("submit_data", move |params: Params| {
