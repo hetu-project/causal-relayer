@@ -15,18 +15,24 @@ pub fn run_json_rpc_server(address: SocketAddr, tx: mpsc::Sender<String>, node: 
 
     let submitted_data = Arc::new(Mutex::new(HashSet::new()));
 
-    io.add_method("submit_data", move |params: Params| {
+    io.add_method("eth_sendRawTransaction", move |params: Params| {
         let tx = tx.clone();
         let submitted_data = submitted_data.clone();
 
         Box::pin(async move {
             match params.parse::<Vec<String>>() {
-                Ok(data) => {
-                    if data.is_empty() {
+                Ok(param_array) => {
+                    if param_array.is_empty() {
+                        warn!("Received empty params array via RPC");
+                        return Err(RpcError::invalid_params("Empty params array"));
+                    }
+
+                    let message = &param_array[0];
+
+                    if message.is_empty() {
                         warn!("Received empty data via RPC");
                         return Ok(Value::String("Received empty data".to_string()));
                     }
-                    let message = data[0].clone(); // Get the first string from the array
 
                     // Check if the data has already been submitted
                     let is_new_data = {
@@ -49,7 +55,7 @@ pub fn run_json_rpc_server(address: SocketAddr, tx: mpsc::Sender<String>, node: 
                             error!("Failed to send data to channel: {:?}", e);
                             // Remove the data from the set if it couldn't be sent
                             let mut submitted_set = submitted_data.lock().unwrap();
-                            submitted_set.remove(&message);
+                            submitted_set.remove(message);
                             Err(RpcError::internal_error())
                         }
                     }

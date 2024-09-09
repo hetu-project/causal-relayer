@@ -16,8 +16,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, Mutex};
-use tokio::time::interval;
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::task;
+use tokio::time::{interval, timeout};
 use tracing::{error, info, warn};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -101,7 +102,10 @@ pub struct NodeInner {
 
 pub struct Node {
     inner: Arc<Mutex<NodeInner>>,
+    drain_sender: mpsc::Sender<oneshot::Sender<DrainResult>>,
 }
+
+type DrainResult = Result<Vec<DataWithClock>, Box<dyn Error + Send + Sync>>;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Tombstone {
@@ -117,15 +121,67 @@ pub enum SyncMessage {
 
 impl Node {
     pub async fn new(swarm: Swarm<NodeBehaviour>) -> Self {
-        Node {
-            inner: Arc::new(Mutex::new(NodeInner {
-                swarm,
-                vector_clock: HashMap::new(),
-                topic: gossipsub::IdentTopic::new("relay_data"),
-                stored_data: BTreeMap::new(),
-                tombstones: Default::default(),
-            })),
+        let (drain_sender, mut drain_receiver) = mpsc::channel::<oneshot::Sender<DrainResult>>(100);
+        let inner = Arc::new(Mutex::new(NodeInner {
+            swarm,
+            vector_clock: HashMap::new(),
+            topic: gossipsub::IdentTopic::new("relay_data"),
+            stored_data: BTreeMap::new(),
+            tombstones: Default::default(),
+        }));
+
+        let inner_clone = inner.clone();
+        task::spawn(async move {
+            while let Some(response_sender) = drain_receiver.recv().await {
+                let result = Self::handle_drain(&inner_clone).await;
+                let _ = response_sender.send(result);
+            }
+        });
+
+        Node { inner, drain_sender }
+    }
+
+    pub async fn drain_data(&self) -> DrainResult {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.drain_sender.send(response_sender).await
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+        response_receiver.await
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?
+    }
+
+    async fn handle_drain(inner: &Arc<Mutex<NodeInner>>) -> DrainResult {
+        let mut inner = inner.lock().await;
+        let drained_data = std::mem::take(&mut inner.stored_data).into_keys().collect::<Vec<_>>();
+        let topic = inner.topic.clone();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs();
+
+        for data in &drained_data {
+            let data_hash = calculate_hash(data);
+            let tombstone = Tombstone {
+                data_hash: data_hash.clone(),
+                drained_at: now,
+            };
+
+            inner.tombstones.insert(data_hash, tombstone.clone());
+
+            let sync_message = SyncMessage::Tombstone(tombstone);
+            let serialized_message = serde_json::to_string(&sync_message)?;
+
+            if let Err(e) = inner
+                .swarm
+                .behaviour_mut()
+                .gossipsub
+                .publish(topic.clone(), serialized_message.into_bytes())
+            {
+                error!("Failed to publish tombstone: {:?}", e);
+            }
         }
+
+        Ok(drained_data)
     }
 
     pub async fn create(config: &Config) -> Result<(Self, PeerId), Box<dyn Error + Send + Sync>> {
@@ -199,7 +255,7 @@ impl Node {
             }
 
             inner.stored_data.insert(data.clone(), ());
-            info!("Stored new or updated data: {:?}", data);
+            // info!("Stored new or updated data: {:?}", data);
 
             // Republish the data with updated clock
             let sync_message = SyncMessage::Data(data);
@@ -269,55 +325,6 @@ impl Node {
         Ok(())
     }
 
-    pub async fn drain_data(&self) -> Result<Vec<DataWithClock>, Box<dyn Error + Send + Sync>> {
-        let (tx, mut rx) = mpsc::channel(1000); // Adjust buffer size as needed
-
-        let mut inner = self.inner.lock().await;
-        let drained_data: Vec<DataWithClock> =
-            std::mem::take(&mut inner.stored_data).into_keys().collect();
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_secs();
-
-        let topic = inner.topic.clone();
-
-        for data in &drained_data {
-            let data_hash = calculate_hash(data);
-            let tombstone = Tombstone {
-                data_hash: data_hash.clone(),
-                drained_at: now,
-            };
-            inner.tombstones.insert(data_hash, tombstone.clone());
-            tx.send((topic.clone(), tombstone)).await?;
-        }
-
-        // Clone the necessary components
-        let inner_clone = self.inner.clone();
-
-        // Release the lock before starting the publishing task
-        drop(inner);
-
-        // Start a task to publish tombstones
-        tokio::spawn(async move {
-            while let Some((topic, tombstone)) = rx.recv().await {
-                let sync_message = SyncMessage::Tombstone(tombstone);
-                let serialized_message = serde_json::to_string(&sync_message).unwrap();
-                let mut inner = inner_clone.lock().await;
-                if let Err(e) = inner
-                    .swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .publish(topic, serialized_message.into_bytes())
-                {
-                    error!("Failed to publish tombstone: {:?}", e);
-                }
-            }
-        });
-
-        Ok(drained_data)
-    }
 
     pub async fn subscribe_to_topic(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut inner = self.inner.lock().await;

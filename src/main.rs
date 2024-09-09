@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let (node, peer_id) = Node::create(&config).await?;
     let node = Arc::new(node);
 
-    let (tx, rx) = mpsc::channel::<String>(100);
+    let (tx, rx) = mpsc::channel::<String>(1000);
 
     let rpc_port = config.get_int("network.rpc_port")? as u16;
     let rpc_address = format!("0.0.0.0:{}", rpc_port).parse()?;
