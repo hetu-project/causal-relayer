@@ -254,6 +254,8 @@ impl Node {
                     .as_secs();
             }
 
+            //TODO: remove duplicate data
+            inner.stored_data.retain(|k, _| k.data != data.data);
             inner.stored_data.insert(data.clone(), ());
             // info!("Stored new or updated data: {:?}", data);
 
